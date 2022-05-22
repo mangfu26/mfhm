@@ -1,39 +1,45 @@
-import os.path
-from logging import Logger
+from typing import Tuple
 
-from httpx import Client, Request, Response
+from httpx import Client as httpClient
+from httpx import AsyncClient as asyncHttpClient
+from httpx import Request, Response
 
-from mfhm.log import Logger, getLogger
-from mfhm.errors import (
-    ServiceCenterCommunicationError,
-    ParameterError,
-    ServiceCallError
-)
+from mfhm.errors import ServiceCallError
+from mfhm.metadata import TransmissionType
 
 
-class SingleServiceProxyMeghod(object):
+class OneCallProxy(object):
     '''
-    单个服务代理的HTTP方法调用对象
+    单个服务调用代理, 一个实例表示一个服务调用
     '''
 
     def __init__(
             self, 
-            url:str,
-            methods:list,
-            logger:Logger = getLogger(os.path.basename(os.path.abspath(__file__))),
-            httpClient:Client = Client(timeout=5)
+            serviceName: str,
+            centerConfig: dict,
+            httpClient: httpClient = httpClient(timeout=5),
+            asyncHttpClient: httpClient = asyncHttpClient(timeout=5)
     ) -> None:
         '''
         Args:
-            url: 目标接口地址
-            methods: 目标接口支持的HTTP方法
-            logger: 日志对象
-            httpClient: httpx客户端
+            serviceName: 服务名称
+            centerConfig: 服务中心配置
+            httpClient: HTTPX的同步HTTP客户端
+            asyncHttpClient: HTTPX的异步HTTP客户端
         '''
-        self.__url = url
-        self.__methods = [method.upper() for method in methods]
-        self.__logger = logger
-        self.__httpClient = httpClient
+        self.serviceName = serviceName
+        self.centerConfig = centerConfig
+        self.httpClient = httpClient
+        self.asyncHttpClient = asyncHttpClient
+        self.name = None
+        self.host = None
+        self.port = None
+        self.transmissionType = None
+        self.transmissionData = None
+        self.apiData = None
+
+        # 实例化后载入服务数据
+        self.reload()
 
     @staticmethod
     def __havePathParameter(url:str) -> bool:
@@ -52,143 +58,251 @@ class SingleServiceProxyMeghod(object):
 
         return False
 
-    def __request(self, method:str, *args, **kwargs) -> Response:
+    def __initCall(self, apiName: str, method: str, *args, **kwargs) -> Request:
         '''
-        请求目标服务
+        调用远程服务接口前的一些初始化工作, 返回一个 httpx.Request 对象
+
+        Args:
+            apiName: 服务的API名称
+            method: API的HTTP调用方法
+            *args, **kwargs: 接口参数
         '''
-        # 如果URL中存在路径参数, 需要从 pathparams 参数中
-        # 取值替换, 拼接为实际请求URL
-        if self.__havePathParameter(self.__url):
+        # 判断待调用接口是否存在, 存在则从缓存中获取API信息
+        apiName = apiName.strip()
+        if not apiName in self.apiData:
+            errorMessage = f'Service {self.serviceName} does not exist api {apiName}'
+            raise ServiceCallError(errorMessage)
+        apiInfo = self.apiData[apiName]
+        
+        # 如果API路径存在动态参数
+        if apiInfo['haveParameter']:
+            # 需要在请求参数中指定 pathparams 参数
             if not 'pathparams' in kwargs:
-                errorMessage = f'There are path parameters in the URL, please use "pathparams" to specify: {self.__url}'
-                raise ParameterError(errorMessage)
-            if not isinstance(kwargs['pathparams'], dict):
-                raise ParameterError(f'"pathparams" parameter value should be a {dict}')
-            self.__url = self.__url.format(**kwargs['pathparams'])
-            # pathparams参数是框架的自定义参数, 用于FastAPI路由中的路径参数填充
-            # 但在httpx中是不存在的参数, 正式发送请求前需要将其移除
+                errorMessage = f'API "{apiName}" is a dynamic path, you need to specify the value through the "pathparams" parameter'
+                raise ServiceCallError(errorMessage) 
+            # 替换路径参数, 得到真实调用路径
+            apiInfo['path'] = apiInfo['path'].format(**kwargs['pathparams'])
             del kwargs['pathparams']
 
-        # 如果调用了目标接口不支持的HTTP方法类型, 抛出错误
-        method = method.upper()
-        if not method in self.__methods:
-            errorMessage = f'The target API supports {self.__methods}, but uses "{method}"'
-            raise ServiceCallError(errorMessage)
+        # 如果远程服务开启了密钥验证传输
+        # 注入密钥验证头, 如果使用headers参数传递了自定义请求头
+        # 则在自定义请求头基础上注入密钥验证头
+        if 'headers' in kwargs:
+            headers = kwargs['headers']
+            del kwargs['headers']
+        else:
+            headers = {}
+        if self.transmissionType == TransmissionType.authKey:
+            headers['MFHM-AuthKey'] = self.transmissionData
 
-        # 向目标发送请求并获取响应
-        request = Request(method=method, url=self.__url, *args, **kwargs)
-        try:
-            return self.__httpClient.send(request=request)
-        except Exception as err:
-            raise ServiceCallError(err)
+        # 确定HTTP方法, 目标服务如果不支持, 抛出错误
+        if not method.upper() in apiInfo['methods']:
+            errorMessage = f'API "{apiName}" has no method "{method}"'
+            raise ServiceCallError()
         
-    def __getattr__(self, __method:str):
-        '''
-        '''
-        return lambda *args, **kwargs : self.__request(__method, *args, **kwargs)
-
-
-class SingleServiceProxy(object):
-    '''
-    单个服务代理
-    '''
-    def __init__(
-            self, 
-            serviceName:str,
-            centerProtocol:str = 'http',
-            centerHost:str = '127.0.0.1',
-            centerPort:int = 21428,
-            logger:Logger = getLogger(os.path.basename(os.path.abspath(__file__))),
-            httpClient:Client = Client(timeout=5)
-    ) -> None:
-        '''
-        Args:
-            serviceName: 目标服务名称
-            centerProtocol: 服务中心协议类型
-            centerHost: 服务中心主机地址
-            centerPort: 服务中心端口
-            logger: 日志对象
-            httpClient: httpx客户端
-        '''
-        self.__serviceName = serviceName
-        self.__centerProtocol = centerProtocol
-        self.__centerHost = centerHost
-        self.__centerPort = centerPort
-        self.__centerBaseUri = f'{self.__centerProtocol}://{self.__centerHost}:{self.__centerPort}'
-        self.__logger = logger
-        self.__httpClient = httpClient
-
-    def __getattr__(self, __apiName: str) -> SingleServiceProxyMeghod:
-        '''
-        向服务中心查询目标服务接口信息并实例化HTTP方法调用实例
-        '''
-        url = f'{self.__centerBaseUri}/api/{self.__serviceName}/{__apiName}'
-        try:
-            response = self.__httpClient.get(url)
-            responseData = response.json()
-        except Exception as err:
-            errorMessage = f'Unable to communicate with service center: {err}'
-            self.__logger.error(errorMessage)
-            raise ServiceCenterCommunicationError(errorMessage)
-
-        if not response.status_code == 200:
-            errorMessage = f'Unable to communicate with service center:\n'
-            errorMessage += f'    HTTP code: {response.status_code}\n'
-            errorMessage += f'    Data: {response.text}'
-            self.__logger.error(errorMessage)
-            raise ServiceCenterCommunicationError(errorMessage)
-
-        # 接口调用实例
-        return SingleServiceProxyMeghod(
-            url=responseData['apiUrl'],
-            methods=responseData['apiMethods'],
-            logger=self.__logger,
-            httpClient=self.__httpClient
+        return Request(
+            method=method.upper(),
+            url=f'http://{self.host}:{self.port}{apiInfo["path"]}',
+            headers=headers,
+            *args, 
+            **kwargs
         )
 
+    def call(self, apiName: str, method: str, *args, **kwargs) -> Response:
+        '''
+        调用远程服务并返回一个 httpx.Response 对象
 
-class ServiceProxy(object):
+        Args:
+            serviceName: 服务名称
+            apiName: 服务的API名称
+            method: API的HTTP调用方法
+            *args, **kwargs: 接口参数
+        '''
+        requestObject = self.__initCall(apiName, method, *args, **kwargs)
+        return self.httpClient.send(requestObject)
+
+    async def asyncCall(self, apiName: str, method: str, *args, **kwargs) -> Response:
+        '''
+        异步调用远程服务并返回一个 httpx.Response 对象
+
+        Args:
+            serviceName: 服务名称
+            apiName: 服务的API名称
+            method: API的HTTP调用方法
+            *args, **kwargs: 接口参数
+        '''
+        requestObject = self.__initCall(apiName, method, *args, **kwargs)
+        return await self.asyncHttpClient.send(requestObject)
+
+    def reload(self) -> None:
+        '''
+        重载服务调用信息
+        '''
+        headers = {}
+
+        # 如果服务中心启用了包装
+        if self.centerConfig['transmissionType']:
+            # 如果包装类型是key
+            headers['MFHM-AuthKey'] = self.centerConfig['transmissionData']
+
+        url = f'http://{self.centerConfig["host"]}:{self.centerConfig["port"]}/service/{self.serviceName}'
+        try:
+            serviceData = self.httpClient.get(url, headers=headers).json()
+        except Exception as err:
+            errorMessage = f'Unable to query service information: {err}'
+            raise ServiceCallError(errorMessage)
+
+        if serviceData['code'] == -1:
+            errorMessage = f'Service "{self.serviceName}" not online'
+            raise ServiceCallError(errorMessage)
+
+        if not serviceData['code'] == 0:
+            errorMessage = 'The service center returns an error status code\n'
+            errorMessage += f'   Code: {serviceData["code"]}'
+            errorMessage += f'   Message: {serviceData["message"]}'
+            raise ServiceCallError(errorMessage)
+
+        self.name = serviceData['name']
+        self.host = serviceData['host']
+        self.port = serviceData['port']
+        self.transmissionType = serviceData['transmissionType']
+        self.transmissionData = serviceData['transmissionData']
+
+        # 新增haveParameter字段用于表示API是否存在路径参数
+        for apiName in serviceData['methods']:
+            if self.__havePathParameter(serviceData['methods'][apiName]['path']):
+                serviceData['methods'][apiName]['haveParameter'] = True
+            else:
+                serviceData['methods'][apiName]['haveParameter'] = False
+
+        self.apiData = serviceData['methods']
+
+    async def asyncReload(self):
+        '''
+        重载服务调用信息(异步)
+        '''
+        headers = {}
+
+        # 如果服务中心启用了包装
+        if self.centerConfig['transmissionType']:
+            # 如果包装类型是key
+            headers['MFHM-AuthKey'] = self.centerConfig['transmissionData']
+
+        url = f'http://{self.centerConfig["host"]}:{self.centerConfig["port"]}/service/{self.serviceName}'
+        try:
+            serviceData = await self.httpClient.get(url, headers=headers).json()
+        except Exception as err:
+            errorMessage = f'Unable to query service information: {err}'
+            raise ServiceCallError(errorMessage)
+
+        if serviceData['code'] == -1:
+            errorMessage = f'Service "{self.serviceName}" not online'
+            raise ServiceCallError(errorMessage)
+
+        if not serviceData['code'] == 0:
+            errorMessage = 'The service center returns an error status code\n'
+            errorMessage += f'   Code: {serviceData["code"]}'
+            errorMessage += f'   Message: {serviceData["message"]}'
+            raise ServiceCallError(errorMessage)
+
+        # 新增haveParameter字段用于表示API是否存在路径参数
+        for apiName in serviceData['methods']:
+            if self.__havePathParameter(serviceData['methods'][apiName]['path']):
+                serviceData['methods'][apiName]['haveParameter'] = True
+            else:
+                serviceData['methods'][apiName]['haveParameter'] = False
+        
+        self.apiData = serviceData['methods']
+
+
+class CallProxy(object):
     '''
-    服务代理
+    服务调用代理
     '''
+
     def __init__(
             self, 
-            centerProtocol:str = 'http',
-            centerHost:str = '127.0.0.1',
-            centerPort:int = 21428,
-            logger:Logger = getLogger(os.path.basename(os.path.abspath(__file__))),
-            httpClient: Client = Client(timeout=5)
+            centerConfig:dict = None, 
+            httpClient: httpClient = httpClient(timeout=5),
+            asyncHttpClient: httpClient = asyncHttpClient(timeout=5)
     ) -> None:
         '''
         Args:
-            centerProtocol: 服务中心协议类型
-            centerHost: 服务中心主机地址
-            centerPort: 服务中心端口
-            logger: 日志对象
-            httpClient: httpx客户端
+            centerConfig: 服务中心配置
+            httpClient: HTTPX的同步HTTP客户端
+            asyncHttpClient: HTTPX的异步HTTP客户端
         '''
-        self.__centerProtocol = centerProtocol
-        self.__centerHost = centerHost
-        self.__centerPort = centerPort
-        self.__logger = logger
-        self.__httpClient = httpClient
-        self.__cache = {}
-            
-    def __getattr__(self, __serviceName: str) -> SingleServiceProxy:
+        self.centerConfig = centerConfig
+        self.httpClient = httpClient
+        self.asyncHttpClient = asyncHttpClient
+
+        # 服务对象缓存
+        self.__serviceCache = {}
+
+        # 不指定服务中心配置时使用默认配置
+        if self.centerConfig == None:
+            self.centerConfig = {
+                'host': '127.0.0.1',
+                'port': 21428,
+                'transmissionType': None,
+                'transmissionData': None
+            }
+
+    def __initCall(
+            self, 
+            serviceName: str
+    ) -> OneCallProxy:
         '''
-        属性名称作为服务名称, 实例化单个服务代理
+        服务调用前的初始化操作
 
         Args:
-            __serviceName: 目标服务名称
+            serviceName: 服务名称
         '''
-        if not __serviceName in self.__cache:
-            self.__cache[__serviceName] = SingleServiceProxy(
-                serviceName=__serviceName,
-                centerProtocol=self.__centerProtocol,
-                centerHost=self.__centerHost,
-                centerPort=self.__centerPort,
-                logger=self.__logger,
-                httpClient=self.__httpClient
+        serviceName = serviceName.strip()
+        if not serviceName:
+            errorMessage = f'The service name cannot be empty, please use the "serviceName" parameter to specify the service to be called'
+            raise ServiceCallError(errorMessage)
+
+        if not serviceName in self.__serviceCache:
+            self.__serviceCache[serviceName] = OneCallProxy(
+                serviceName=serviceName,
+                centerConfig=self.centerConfig,
+                httpClient=self.httpClient,
+                asyncHttpClient=self.asyncHttpClient
             )
 
-        return self.__cache[__serviceName]
+    def call(self, serviceName: str, apiName: str, method: str, *args, **kwargs):
+        '''
+        调用远程服务(同步)
+
+        Args:
+            serviceName: 服务名称
+            apiName: 服务的API名称
+            method: API的HTTP调用方法
+            *args, **kwargs: 接口参数
+        '''
+        self.__initCall(serviceName=serviceName)
+        return self.__serviceCache[serviceName].call(apiName, method, *args, **kwargs)
+
+    async def asyncCall(self, serviceName: str, apiName: str, method: str, *args, **kwargs):
+        '''
+        调用远程服务(异步)
+
+        Args:
+            serviceName: 服务名称
+            apiName: 服务的API名称
+            method: API的HTTP调用方法
+            *args, **kwargs: 接口参数
+        '''
+        self.__initCall(serviceName=serviceName)
+        return await self.__serviceCache[serviceName].asyncCall(apiName, method, *args, **kwargs)
+
+    def get(self, serviceName: str):
+        '''
+        获取某个服务的代理实例
+
+        Args:
+            serviceName: 待获实例的服务名称
+        '''
+
+

@@ -1,2 +1,4 @@
-env
-dist
+env/
+__pycache__/
+data/
+/test*

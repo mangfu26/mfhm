@@ -32,3 +32,17 @@ class ParameterError(Exception):
     '''
     参数错误
     '''
+
+
+class WrapperError(Exception):
+    '''
+    服务包装器错误
+    '''
+
+
+class ConfigError(Exception):
+    '''
+    配置错误
+    '''
+
+

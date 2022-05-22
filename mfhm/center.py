@@ -1,19 +1,20 @@
-import json
+import threading
 import asyncio
 import os.path
-from urllib.parse import urljoin
+import json
+from os import getcwd
 from time import sleep
-from os import makedirs, getpid
-from threading import Thread
-from typing import Dict, List
+from urllib.parse import urljoin
+from typing import Dict, Union, List
 
-import httpx
-from fastapi import FastAPI, Request, Path
+from httpx import AsyncClient as asyncHttpClient
+from fastapi import Request, Path
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
+from mfhm.service import BasicServices
 from mfhm.log import getLogger
-from mfhm.errors import PathError
+from mfhm.metadata import TransmissionType, TransmissionTypeField
 
 
 # -------------------------------------------------
@@ -24,142 +25,78 @@ class ServiceOnlineMethodModel(BaseModel):
 
 
 class ServiceOnlineModel(BaseModel):
-    name:str = Field(..., min_length=1, max_length=500)
-    port:int = Field(..., ge=1, le=65535)
+    name: str = Field(..., min_length=1, max_length=500)
+    port: int = Field(..., ge=1, le=65535)
+    transmissionType: Union[None, str] = Field(..., min_length=1, max_length=1024)
+    transmissionData: Union[None, str] = Field(..., min_length=1, max_length=10240)
     methods: Dict[str, ServiceOnlineMethodModel]
 
+    @validator('transmissionType')
+    def transmissionTypeWhitelistValidator(cls, value: Union[None, str]):
+        if isinstance(value, str):
+            whitelist = TransmissionType.all()
+            value = value.strip()
+            if not value in whitelist:
+                raise ValueError(f'Transmission Type error, only allowed is {whitelist}')
 
-class ServiceCenter(object):
-    '''
-    服务中心
-    '''
+        return value
 
+
+class ServiceCenter(BasicServices):
+    '''
+    服务中心类, 一个实例代表一个服务中心
+    '''
     def __init__(
             self, 
-            host:str = '0.0.0.0', 
-            port:int = 21428,
-            pingTestInterval:int = 10,
-            pingTestTimeout:int = 5,
-            cacheSaveInterval:int = 60,
-            dataDir:str = None,
-            cacheFilename:str = 'centerCache.json',
+            serviceName: str = 'ServiceCenter', 
+            serviceHost: str = '0.0.0.0', 
+            servicePort: int = 21428, 
+            pingTestInterval: int = 5,
+            pingTestTimeout: int = 5,
+            dataDir:str = os.path.join(getcwd(), 'data'),
+            cacheSaveInterval: int = 120,
+            asyncHttpClient: asyncHttpClient = asyncHttpClient(),
             logger = getLogger(os.path.basename(os.path.abspath(__file__))),
-            asyncHttpClient = httpx.AsyncClient()
     ) -> None:
         '''
         Args:
-            host: 服务中心主机地址
-            port: 服务中心监听端口
-            pingTestInterval: ping测试时间间隔, 服务中心会定时向服务发送一个ping
-                              测试请求用于测试服务是否在线, 并且会根据该ping测试
-                              的响应时长作为负载均衡的的调度依据, 该值单位为秒
-            pingTestTimeout: ping测试的超时时间, 如果被托管的服务未在该指定时间内
-                             响应服务中心的ping测试请求, 则服务中心会将该服务视为
-                             已掉线, 该服务的信息将会从服务中心移除并等待重新上线,
-                             该参数值单位为秒且值不能大于参数pingTestInterval的
-                             值
-            cacheSaveInterval: 缓存定时保存时间间隔, 单位为秒. 服务中心将所有的服务
-                               数据存储在内存中, 当服务中心意外掉线或重启时会造成托
-                               管的服务数据丢失, 所以会定时将服务数据定时持久化到磁
-                               盘中
+            serviceName: 服务中心名称
+            serviceHost: 服务主机地址(监听地址)
+            servicePort: 服务端口(监听端口)
+            pingTestInterval: ping测试间隔(单位:秒)
+            pingTestTimeout: ping测试超时(单位: 秒), 该值不应该大于pingTestInterval
             dataDir: 数据存储目录
-            cacheFilename: 缓存文件名称
-            logger: 日志对象
-            asyncHttpClient: HTTPX的异步会话客户端
+            cacheSaveInterval: 缓存保存间隔
+            asyncHttpClient: HTTPX异步客户端
         '''
-        self.host = host
-        self.port = port
+        self.dataDir = dataDir
         self.pingTestInterval = pingTestInterval
         self.pingTestTimeout = pingTestTimeout
         self.cacheSaveInterval = cacheSaveInterval
-        self.dataDir = dataDir
-        self.cacheFilename = cacheFilename
-        self.logger = logger
         self.asyncHttpClient = asyncHttpClient
-        self.pid = None
-
-        # 本地缓存, 用于存储服务信息, 格式如下
-        # {
-        #     serviceName: [
-        #         {
-        #             'host': serviceHost,
-        #             'port': servicePort,
-        #             'ping': pingTestValue,
-        #             'methods': {
-        #                 apiName: {
-        #                     'path': 'apiUrlPath',
-        #                     'methods': 'apiHttpMethods'
-        #                 },
-        #                 .......
-        #             }
-        #         },
-        #         .........
-        #     ],
-        #     .......
-        # }
+        self.logger = logger
         self.__cache = {}
-        self.loadCache()
+        super().__init__(
+            serviceName=serviceName, 
+            serviceHost=serviceHost, 
+            servicePort=servicePort, 
+            dataDir=dataDir, 
+            asyncHttpClient=asyncHttpClient
+        )
 
-        self.app = FastAPI()
-        # 服务关闭后写立即保存缓存
-        self.app.add_event_handler('shutdown', self.saveCache)
-        # 绑定路由处理函数
-        self.app.add_api_route('/online', self.online, methods=['POST'], name='online')
-        self.app.add_api_route('/offline/{name}/{port}', self.offline, methods=['DELETE'], name='offline')
-        self.app.add_api_route('/service/{name}', self.serviceInfo, methods=['GET'], name='service')
-        self.app.add_api_route('/api/{name}/{apiName}', self.apiInfo, methods=['GET'], name='api')
-
-        # 缓存定时保存线程
-        cacheSaveThread = Thread(target=self.__cycleSaveCache, daemon=True)
-        cacheSaveThread.start()
-
-        # ping定时测试线程
-        pingTestThread = Thread(target=self.__runPingTest, daemon=True)
+        # ping测试周期线程
+        pingTestThread = threading.Thread(target=self.__startPeriodicPingTest, daemon=True)
         pingTestThread.start()
 
-    @property
-    def dataDir(self):
-        return self.__dataDir
+        # 载入本地缓存
+        self.__loadCache()
 
-    @dataDir.setter
-    def dataDir(self, value:str):
-        # 未指定数据存储目录时, 使用当前目录下的data目录作为数据目录
-        if value == None:
-            self.__dataDir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-            self.__makeSureDir(self.__dataDir)
-            return None
+        # 缓存周期保存线程
+        cacheSaveThread = threading.Thread(target=self.__periodicSaveCache, daemon=True)
+        cacheSaveThread.start()
 
-        if not isinstance(value, str):
-            raise ValueError(f'dataDir参数应该是{str}类型的值')
-
-        # 如果提供了一个已存在的路径
-        if os.path.exists(value):
-            # 且路径是文件的
-            if os.path.isfile(value):
-                raise PathError(f'"{value}" 路径指向了一个文件, 无法将此路径作为数据存储目录')
-        # 否则创建目录
-        else:
-            self.__makeSureDir(value)
-
-        self.__dataDir = value
-            
-    @staticmethod
-    def __makeSureDir(dirPath:str) -> None:
-        '''
-        确保目录存在, 如果dirPath已存在则忽略, 否则将会创建目录
-        '''
-        try:
-            makedirs(dirPath)
-        except Exception as err:
-            pass
-
-    def __cycleSaveCache(self) -> None:
-        '''
-        周期调用缓存保存方法将缓存保存到磁盘
-        '''
-        while True:
-            self.saveCache()
-            sleep(self.cacheSaveInterval)
+        # 服务关闭时将缓存立即写入磁盘
+        self.add_event_handler('shutdown', self.__saveCache)
 
     def __deleteService(self, name:str, host:str, port:int) -> bool:
         '''
@@ -182,6 +119,27 @@ class ServiceCenter(object):
                         return True
         return False
 
+    def __startPeriodicPingTest(self):
+        '''
+        启动周期Ping测试
+        '''
+        asyncio.run(self.__periodicPingTest())
+
+    async def __periodicPingTest(self):
+        '''
+        周期Ping测试
+        '''
+        while True:
+            sleep(self.pingTestInterval)
+            # 在循环中使用await等待时Python会将整个循环视为一个协程, 不能达到异步
+            # 的目的, 需要创建任务后统一执行
+            taskList = []
+            for serviceName in self.__cache:
+                for serviceData in self.__cache[serviceName]:
+                    taskList.append(self.__onePingTest(serviceName, serviceData))
+
+            await asyncio.gather(*taskList)
+            
     async def __onePingTest(self, name:str, serviceData: dict) -> None:
         '''
         向单个被托管服务发送ping测试
@@ -192,36 +150,46 @@ class ServiceCenter(object):
         '''
         host = serviceData['host']
         port = serviceData['port']
+        headers = {}
+
+        # 如果目标服务启用了传输认证
+        if serviceData['transmissionType']:
+            # 且传输认证类型是密钥验证
+            if serviceData['transmissionType'] == TransmissionType.authKey:
+                # 请求头中携带服务中心的传输验证密钥
+                headers[TransmissionTypeField.headers.get(TransmissionType.authKey)] = serviceData['transmissionData']
+
         url = f'http://{host}:{port}/ping'
         try:
-            response = await self.asyncHttpClient.get(url, timeout=self.pingTestTimeout)
+            response = await self.asyncHttpClient.get(url, headers=headers, timeout=self.pingTestTimeout)
             self.logger.debug(f'Ping test: [{name}]{url}')
         except Exception as err:
             # 测试失败时讲服务视为已掉线, 从缓存中移除服务数据
             self.__deleteService(name=name, host=host, port=port)
             self.logger.warning(f'ping test failed [{name}]{url}, remove service data: {err}')
             return None
+
+        # 状态码非200时视为服务测试失败, 从缓存中移除服务数据
+        if not response.status_code == 200:
+            self.__deleteService(name=name, host=host, port=port)
+            self.logger.warning(
+                f'ping test failed [{name}]{url}, remove service data:\n\
+                    HTTP Statu code: {response.status_code}\n\
+                    Respon data: {response.content}')
+            return None
         
         # 响应时长
         serviceData['ping'] = response.elapsed.total_seconds()
 
-    async def __pingTest(self):
+    def __periodicSaveCache(self) -> None:
         '''
-        向服被托管服务发送ping测试并记录响应时长
+        周期调用缓存保存方法将缓存保存到磁盘
         '''
         while True:
-            for serviceName in self.__cache:
-                for serviceData in self.__cache[serviceName]:
-                    await self.__onePingTest(name=serviceName, serviceData=serviceData)
-            await asyncio.sleep(self.pingTestInterval)
+            self.__saveCache()
+            sleep(self.cacheSaveInterval)
 
-    def __runPingTest(self):
-        '''
-        启动ping测试
-        '''
-        asyncio.run(self.__pingTest())
-
-    def saveCache(self) -> bool:
+    def __saveCache(self) -> bool:
         '''
         将缓存保存到磁盘
 
@@ -233,8 +201,7 @@ class ServiceCenter(object):
             True: 保存成功
             False: 保存失败
         '''
-        saveFilePath = os.path.join(self.dataDir, self.cacheFilename)
-
+        saveFilePath = os.path.join(self.dataDir, 'centerCache.json')
         try:        
             with open(saveFilePath, 'w', encoding='utf-8') as f:
                 json.dump(self.__cache, f)
@@ -244,11 +211,11 @@ class ServiceCenter(object):
 
         return True
 
-    def loadCache(self) -> bool:
+    def __loadCache(self) -> bool:
         '''
         从磁盘加载缓存
         '''
-        cacheFilePath = os.path.join(self.dataDir, self.cacheFilename)
+        cacheFilePath = os.path.join(self.dataDir, 'centerCache.json')
         if os.path.isfile(cacheFilePath):
             try:
                 with open(cacheFilePath, 'r', encoding='utf-8') as f:
@@ -261,33 +228,10 @@ class ServiceCenter(object):
 
     async def online(self, request:Request, serviceData: ServiceOnlineModel):
         '''
-        服务上线
-
-        Args:
-            request: 请求对象, 用于获取客户端的请求信息
-            serviceData: 待上线服务的信息数据, 格式如下:
-                        {
-                            'name': '服务名称',
-                            'port': '服务端口',
-                            'methods': {
-                                '方法名称': {
-                                    'path': '该方法调用地址的path'
-                                }
-                            }
-                        }
-
-        Returns:
-            HTTP Code 200: 请求处理成功, 返回一个JSON {'code': xx, 'message': 'xxx'}
-                code: 状态码
-                     0: 服务上线成功
-                    -1: 服务已上线, 不能重复上线
-                message: 各状态码对应的提示消息
-            HTTP Code 422: 请求参数错误
-            HTTP Code 500: 服务内部错误
+        服务上线接口
         '''
         result = {'code': 0, 'message': 'ok'}
         serviceData = serviceData.dict()
-
         serviceHost = request.client.host
 
         # 如果请求上线的服务已在缓存中存在同名服务
@@ -301,12 +245,14 @@ class ServiceCenter(object):
                    return result
         else:
             self.__cache[serviceName] = []
-        
+
         # 上线成功, 向缓存中写入服务信息
         self.__cache[serviceName].append({
             'host': serviceHost,
             'port': serviceData['port'],
             'ping': -1,
+            'transmissionType': serviceData['transmissionType'],
+            'transmissionData': serviceData['transmissionData'],
             'methods': serviceData['methods']
         })
 
@@ -357,11 +303,7 @@ class ServiceCenter(object):
         '''
         result = {
             'code': 0, 
-            'message': 'ok',
-            'name': '',
-            'host': '',
-            'port': '',
-            'methods': {}
+            'message': 'ok'
         }
 
         name = name.strip()
@@ -385,6 +327,8 @@ class ServiceCenter(object):
                 result['name'] = name
                 result['host'] = minPingValueServiceData['host']
                 result['port'] = minPingValueServiceData['port']
+                result['transmissionType'] = minPingValueServiceData['transmissionType']
+                result['transmissionData'] = minPingValueServiceData['transmissionData']
                 result['methods'] = minPingValueServiceData['methods']
                 return result
 
@@ -409,7 +353,7 @@ class ServiceCenter(object):
             HTTP Code 200: 请求处理成功, 返回一个包含接口信息的JSON
             HTTP Code 500: 服务内部错误
         '''
-        result = {'code': 0, 'message': 'ok', 'apiUrl': '', 'apiMethods': []}
+        result = {'code': 0, 'message': 'ok'}
 
         name = name.strip()
         apiName = apiName.strip()
@@ -438,6 +382,13 @@ class ServiceCenter(object):
                         result['apiMethods'] = serviceData['methods'][methodName]['methods']
                         return result
 
+                result['code'] = -1
+                result['message'] = f'API "{apiName}" does not exist for the service "{name}"'
+                return JSONResponse(
+                    status_code=404, 
+                    content=result
+                )
+
         result['code'] = -1
         result['message'] = 'Service not online'
         return JSONResponse(
@@ -445,46 +396,16 @@ class ServiceCenter(object):
             content=result
         )
 
-    def start(self):
+    async def ping(self):
+        return {'code': 0, 'message': 'ok'}
+
+    def initApi(self):
         '''
-        启动服务
+        初始化API接口
         '''
-        import uvicorn 
-        self.pid = getpid()
-
-        # 覆盖uvicorn默认日志配置, 转用log模块提供的日志处理程序, 
-        # 统一日志格式
-        logConfig = {
-            'version': 1,
-            'disable_existing_loggers': False,
-            'formatters': {
-                'default': {
-                    '()': 'mfhm.log.Formatter'
-                }
-            },
-            'handlers': {
-                'default': {
-                    'formatter': 'default',
-                    'class': 'mfhm.log.ConsoleHighlightedHandler',
-                }
-            },
-            'loggers': {
-                'uvicorn': {
-                    'handlers': ['default'],
-                    'level': 'INFO'
-                },
-                'uvicorn.error': {
-                    'handlers': ['default'],
-                    'level': 'INFO',
-                    'propagate': False
-                },
-                'uvicorn.access': {
-                    'handlers': ['default'],
-                    'level': 'INFO',
-                    'propagate': False
-                }
-            }
-        }
-
-        uvicorn.run(self.app, host=self.host, port=self.port, debug=False, log_config=logConfig)
-
+        # 绑定路由处理函数
+        self.add_api_route('/online', self.online, methods=['POST'], name='online')
+        self.add_api_route('/offline/{name}/{port}', self.offline, methods=['DELETE'], name='offline')
+        self.add_api_route('/service/{name}', self.serviceInfo, methods=['GET'], name='service')
+        self.add_api_route('/api/{name}/{apiName}', self.apiInfo, methods=['GET'], name='api')
+        self.add_api_route('/ping', self.ping, methods=['GET'], name='ping')

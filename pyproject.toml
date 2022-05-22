@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "mfhm"
-version = "0.0.1"
+version = "0.1.0"
 authors = [{name = "MangFu", email = "2560782597@qq.com"}]
 description = "HTTP microservice package based on FastAPI and HTTPX"
 readme = "README.md"
@@ -15,8 +15,8 @@ classifiers = [
 ]
 requires-python = ">=3.6.1"
 dependencies = [
-    "httpx>=0.22.0",
-    "fastapi>=0.75.2",
+    "httpx==0.22.0",
+    "fastapi==0.75.2",
     "uvicorn[standard]"
 ]
 
