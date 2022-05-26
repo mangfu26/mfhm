@@ -5,7 +5,7 @@ from fastapi.routing import APIRoute
 from fastapi import Request, Response
 
 from mfhm.utils import generateServiceKey
-from mfhm.service import BasicServices
+from mfhm.service import BasicServices, SubService
 from mfhm.errors import WrapperError
 from mfhm.metadata import TransmissionType, TransmissionTypeField
 
@@ -15,7 +15,7 @@ class KeyAuth(object):
     服务密钥包装器, 包装后的服务将启用服务密钥验证
     '''
   
-    def __new__(cls: type, service: BasicServices, *args, **kwargs) -> BasicServices:
+    def __new__(cls: type, serviceClass: BasicServices, *args, **kwargs) -> BasicServices:
 
         class RouteHandler(APIRoute):
             '''
@@ -33,18 +33,19 @@ class KeyAuth(object):
                     mfhmAuthKey = request.headers.get(
                         TransmissionTypeField.headers.get(TransmissionType.authKey)
                     )
+
                     if mfhmAuthKey:
                         if mfhmAuthKey == self.__class__.serviceKey:
                             return await originalRouteHandler(request)
                     # 校验失败返回403
                     return Response(
                         status_code=403,
-                        content="You don't have permission to access service"
+                        content=f"You don't have permission to access service"
                     )
 
                 return customRouteHandler
         
-        service = service(*args, **kwargs)
+        service = serviceClass(*args, **kwargs)
 
         # 确保服务中已指定数据目录
         if not service.dataDir:
@@ -72,7 +73,11 @@ class KeyAuth(object):
         service.transmissionData = RouteHandler.serviceKey
 
         # 为服务指定API路由处理类
-        service.router.route_class = RouteHandler
+        # 子服务的路由处理类是 .route_class, 与服务本身的路由处理类有所区别
+        if issubclass(serviceClass, SubService):
+            service.route_class = RouteHandler
+        else:
+            service.router.route_class = RouteHandler
 
         return service
 

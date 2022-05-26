@@ -1,10 +1,10 @@
 import os.path
-from re import T
 from typing import Union
 from os import getpid, makedirs
-from typing import Union, List, Tuple, Set
+from typing import Union
 
 from fastapi import FastAPI
+from fastapi import APIRouter
 from httpx import Client as httpClient
 from httpx import AsyncClient as asyncHttpClient
 
@@ -135,7 +135,7 @@ class Service(BasicServices):
             serviceName: str, 
             serviceHost: str = '0.0.0.0', 
             servicePort: int = 21429, 
-            centerConfig: str = {'transmissionType': None, 'transmissionData': None, 'uri': 'http://127.0.0.1:21428'},
+            centerConfig: dict = None,
             dataDir:str = None,
             httpClient: httpClient = httpClient(), 
             logger = getLogger(os.path.basename(os.path.abspath(__file__)))
@@ -151,6 +151,16 @@ class Service(BasicServices):
         '''
         self.centerConfig = centerConfig
         self.logger = logger
+
+        # 不指定服务中心配置时使用默认配置
+        if self.centerConfig == None:
+            self.centerConfig = {
+                'host': '127.0.0.1',
+                'port': 21428,
+                'transmissionType': None,
+                'transmissionData': None
+            }
+
         super().__init__(
             serviceName=serviceName, 
             serviceHost=serviceHost, 
@@ -180,7 +190,7 @@ class Service(BasicServices):
         for route in self.routes:
             methods[route.name] = {'path': route.path, 'methods': list(route.methods)}
 
-        url = f'{self.centerConfig["uri"]}/online'
+        url = f'http://{self.centerConfig["host"]}:{self.centerConfig["port"]}/online'
         try:
             response = self.httpClient.post(url, headers=headers, json={
                 'name': self.serviceName,
@@ -215,11 +225,6 @@ class Service(BasicServices):
         '''
         headers = {}
 
-        # 如果服务中心启用了包装
-        if self.centerConfig['transmissionType']:
-            # 如果包装类型是key
-            headers['MFHM-AuthKey'] = self.centerConfig['transmissionData']
-
         # 如果服务中心启用了传输认证
         if self.centerConfig['transmissionType']:
             # 且传输认证类型是密钥验证
@@ -227,7 +232,7 @@ class Service(BasicServices):
                 # 请求头中携带服务中心的传输验证密钥
                 headers[TransmissionTypeField.headers.get(TransmissionType.authKey)] = self.centerConfig['transmissionData']
         
-        url = f'{self.centerConfig["uri"]}/offline/{self.serviceName}/{self.servicePort}'
+        url = f'http://{self.centerConfig["host"]}:{self.centerConfig["port"]}/offline/{self.serviceName}/{self.servicePort}'
         try:
             self.httpClient.delete(url, headers=headers, timeout=5)
         except Exception as err:
@@ -249,6 +254,67 @@ class Service(BasicServices):
     def start(self):
         self.online()
         super().start()
+
+
+class SubService(APIRouter):
+    '''
+    子服务, 用于模块化/和自定义服务用途, 其本质上是
+    FastAPI的APIRouter
+    '''
+
+    def __init__(
+            self, 
+            dataDir:str = None,
+            httpClient:httpClient = None,
+            asyncHttpClient:asyncHttpClient = None,
+            *args,
+            **kwargs
+    ):
+        '''
+        Args:
+            dataDir: 数据存储目录
+            httpClient: HTTPX同步客户端
+            asyncHttpClient: HTTPX异步客户端
+        '''
+        self.dataDir = dataDir
+        self.httpClient = httpClient
+        self.asyncHttpClient = asyncHttpClient
+        super().__init__(*args, **kwargs)
+
+    @property
+    def dataDir(self):
+        return self.__dataDir
+
+    @dataDir.setter
+    def dataDir(self, value: Union[str, None]):
+        # 未指定数据存储目录时, 无需做任何处理
+        if value == None:
+            self.__dataDir = None
+            return None
+
+        if not isinstance(value, str):
+            raise ValueError(f'Args "dataDir" should be a value of type {str}')
+
+        # 如果提供了一个已存在的路径
+        if os.path.exists(value):
+            # 且路径指向一个文件
+            if os.path.isfile(value):
+                raise PathError(f'The "{value}" path points to a file, this path cannot be used as a data storage directory')
+        # 否则创建目录
+        else:
+            self.__makeSureDir(value)
+
+        self.__dataDir = value
+
+    @staticmethod
+    def __makeSureDir(dirPath:str) -> None:
+        '''
+        确保目录存在, 如果dirPath已存在则忽略, 否则将会创建目录
+        '''
+        try:
+            makedirs(dirPath)
+        except Exception as err:
+            pass
 
 
 

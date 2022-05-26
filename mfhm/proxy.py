@@ -5,7 +5,7 @@ from httpx import AsyncClient as asyncHttpClient
 from httpx import Request, Response
 
 from mfhm.errors import ServiceCallError
-from mfhm.metadata import TransmissionType
+from mfhm.metadata import TransmissionType, TransmissionTypeField
 
 
 class OneCallProxy(object):
@@ -84,22 +84,25 @@ class OneCallProxy(object):
             apiInfo['path'] = apiInfo['path'].format(**kwargs['pathparams'])
             del kwargs['pathparams']
 
-        # 如果远程服务开启了密钥验证传输
-        # 注入密钥验证头, 如果使用headers参数传递了自定义请求头
-        # 则在自定义请求头基础上注入密钥验证头
-        if 'headers' in kwargs:
-            headers = kwargs['headers']
-            del kwargs['headers']
-        else:
-            headers = {}
-        if self.transmissionType == TransmissionType.authKey:
-            headers['MFHM-AuthKey'] = self.transmissionData
+        headers = {}
+        
+        # 如果目标服务开启了传输包装
+        if self.transmissionType:
+            # 如果包装类型是密钥验证
+            if self.transmissionType == TransmissionType.authKey:
+                # 请求头插入验证密钥字段
+                # 如果用户有传入自定义HTTP头, 则在自定义头HTTP的基础上插入密钥验证字段
+                if 'headers' in kwargs:
+                    headers = kwargs['headers']
+                    del kwargs['headers']
+                headers[TransmissionTypeField.headers.get(TransmissionType.authKey)] = self.transmissionData
 
         # 确定HTTP方法, 目标服务如果不支持, 抛出错误
         if not method.upper() in apiInfo['methods']:
             errorMessage = f'API "{apiName}" has no method "{method}"'
             raise ServiceCallError()
         
+        # 构造请求对象并返回
         return Request(
             method=method.upper(),
             url=f'http://{self.host}:{self.port}{apiInfo["path"]}',
@@ -142,8 +145,16 @@ class OneCallProxy(object):
 
         # 如果服务中心启用了包装
         if self.centerConfig['transmissionType']:
-            # 如果包装类型是key
-            headers['MFHM-AuthKey'] = self.centerConfig['transmissionData']
+            # 如果服务中心的包装类型是密钥验证
+            if self.centerConfig['transmissionType'] == TransmissionType.authKey:
+                # 请求头中插入密钥验证字段
+                 headers[TransmissionTypeField.headers.get(TransmissionType.authKey)] = self.centerConfig['transmissionData']
+
+        if self.transmissionType == TransmissionType.authKey:
+            # 且传输认证类型是密钥验证
+            if self.centerConfig['transmissionType'] == TransmissionType.authKey:
+                # 请求头中携带服务中心的传输验证密钥
+                headers[TransmissionTypeField.headers.get(TransmissionType.authKey)] = self.transmissionData
 
         url = f'http://{self.centerConfig["host"]}:{self.centerConfig["port"]}/service/{self.serviceName}'
         try:
@@ -185,8 +196,10 @@ class OneCallProxy(object):
 
         # 如果服务中心启用了包装
         if self.centerConfig['transmissionType']:
-            # 如果包装类型是key
-            headers['MFHM-AuthKey'] = self.centerConfig['transmissionData']
+            # 如果服务中心的包装类型是密钥验证
+            if self.centerConfig['transmissionType'] == TransmissionType.authKey:
+                # 请求头中插入密钥验证字段
+                 headers[TransmissionTypeField.headers.get(TransmissionType.authKey)] = self.centerConfig['transmissionData']
 
         url = f'http://{self.centerConfig["host"]}:{self.centerConfig["port"]}/service/{self.serviceName}'
         try:
@@ -222,7 +235,7 @@ class CallProxy(object):
 
     def __init__(
             self, 
-            centerConfig:dict = None, 
+            centerConfig: dict = None, 
             httpClient: httpClient = httpClient(timeout=5),
             asyncHttpClient: httpClient = asyncHttpClient(timeout=5)
     ) -> None:
