@@ -14,4 +14,4 @@
 
 ## 文档：
 
-在线文档: [https://mangfu26.github.io/mfhm/](https://mangfu26.github.io/mfhm/)
+在线文档: [https://mangfu26.github.io/mfhm/site/](https://mangfu26.github.io/mfhm/site/)
