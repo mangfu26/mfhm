@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "mfhm"
-version = "0.1.0"
+version = "0.1.1"
 authors = [{name = "MangFu", email = "2560782597@qq.com"}]
 description = "HTTP microservice package based on FastAPI and HTTPX"
 readme = "README.md"
